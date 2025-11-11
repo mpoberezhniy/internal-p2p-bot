@@ -1,0 +1,11 @@
+version: '3'
+
+services:
+  unified_bot:
+    build: .
+    network_mode: host
+    container_name: unified_bot
+    environment:
+      - BOT_TOKEN=8506374249:AAFB3LmrPk4nl-2vWXB_L3QHXkM8PtlWg9g
+      - BASE_URL=${BASE_URL:-http://localhost:8000}
+    restart: unless-stopped
