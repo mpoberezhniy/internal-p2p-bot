@@ -1,11 +1,21 @@
 version: '3'
 
 services:
-  unified_bot:
+  trading_bot:
     build: .
     network_mode: host
-    container_name: unified_bot
+    container_name: trading_bot
     environment:
       - BOT_TOKEN=8506374249:AAFB3LmrPk4nl-2vWXB_L3QHXkM8PtlWg9g
       - BASE_URL=${BASE_URL:-http://localhost:8000}
+    command: python bot.py
+    restart: unless-stopped
+  notifications_bot:
+    build: .
+    network_mode: host
+    container_name: notification_bot
+    environment:
+      - BOT_TOKEN=8585411185:AAGQvXcEu1dWsR2rG2wq3erIfh6lx0X0iUM
+      - BASE_URL=${BASE_URL:-http://localhost:8000}
+    command: python notifications-bot.py
     restart: unless-stopped

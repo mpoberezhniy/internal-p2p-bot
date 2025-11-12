@@ -1,25 +1,20 @@
 """
 Telegram bot: streamlined taker workflow for internal P2P.
 
-Flow for Quick take:
-1) Preview (not taken): masked card + rate + amounts, buttons: [Оплатить] [Выбрать другой]
-2) On 'Оплатить': call take, fetch detail, show FULL card + amounts + rate, button: [Оплачено]
-
 Kept features:
 - login (/start)
-- free orders list with pagination
+- available orders list with pagination (теперь "Доступные" = только pending & not taken)
 - quick take flow
 - export CSV
 - request withdrawal (pick maker -> TRC20)
-- notifications every 5s
 
-Removed from UI and code:
-- 'Мои активные', 'Детали ордера', 'Сообщение в ордер',
-- 'Отменить оплату', 'Отменить ордер' (и связанные состояния/функции)
-
-Config (env):
-  - BOT_TOKEN : Telegram token
-  - BASE_URL  : Django backend root (default http://localhost:8000)
+Added/updated:
+- Полная строка ордера в списках: USDT/UAH, курс, маска карты, остаток.
+- Новое меню “Мои активные ордера” — ордера текущего тейкера со статусами taken/partially_paid.
+- В деталке ордера показывается “К оплате сейчас” (remaining_uah, иначе amount_uah).
+- В деталке свободного ордера доступна кнопка “Взять”.
+- В деталке активного — “Оплачено”, “Частично оплачено”, “Оплатить позже”.
+- Пагинация поддерживает префиксы страниц для “avail” и “myact”.
 """
 
 import logging
@@ -64,11 +59,13 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
     STATE_USERNAME,
     STATE_PASSWORD,
     STATE_MENU,
-    STATE_QUICK_PREVIEW,        # превью кандидатного ордера (ещё не взяли)
-    STATE_AFTER_TAKE_ACTION,    # после take: только 'Оплачено'
-    STATE_WITHDRAW_PICK_MAKER,  # выбор мейкера для вывода
-    STATE_WITHDRAW_ADDRESS,     # ввод адреса TRC20
-) = range(7)
+    STATE_QUICK_PREVIEW,        # preview candidate (not yet taken)
+    STATE_AFTER_TAKE_ACTION,    # after take: "Оплачено" only (legacy quick-take flow)
+    STATE_WITHDRAW_PICK_MAKER,  # choose maker for withdrawal
+    STATE_WITHDRAW_ADDRESS,     # input TRC20 address
+    STATE_VIEW_ORDER,           # view opened order (from available/my orders)
+    STATE_PARTIAL_AMOUNT,       # input partial pay amount
+) = range(9)
 
 # ───────────────────── In-memory session data ────────────────
 user_sessions: Dict[int, requests.Session] = {}
@@ -80,19 +77,27 @@ candidates_by_chat: Dict[int, List[dict]] = {}
 
 # pagination caches
 PAGE_SIZE = 10
-cache_free_orders: Dict[int, List[dict]] = {}
+cache_available_orders: Dict[int, List[dict]] = {}
 
-# current taken order id (для 'Оплачено')
+# current opened order id (for view-order actions)
 current_order_id: Dict[int, int] = {}
 
 # withdraw selection
 user_selected_maker: Dict[int, Tuple[int, str]] = {}  # chat_id -> (maker_id, maker_username)
 
 # ───────────────────────── Helpers ───────────────────────────
+def fallback_show_menu(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "Используйте /menu для навигации.",
+        reply_markup=ReplyKeyboardMarkup([["/menu"]], resize_keyboard=True)
+    )
+    return STATE_MENU
+
 def _norm_status(s: str) -> str:
     return str(s or "").strip().lower().replace(" ", "_")
 
 FREE_STATUSES = {"awaiting_payment", "pending", "new"}
+MY_ACTIVE_STATUSES = {"taken", "partially_paid"}
 
 def _order_sort_key(o: dict):
     ts = o.get("created_at") or ""
@@ -112,7 +117,6 @@ def _rate(o: dict) -> float:
         return 0.0
 
 def _extract_masked_card(o: dict) -> str:
-    # маска для превью
     for key in ("card_mask", "card", "bank", "iban"):
         v = o.get(key)
         if v:
@@ -120,27 +124,35 @@ def _extract_masked_card(o: dict) -> str:
     return "—"
 
 def _extract_full_card(o: dict) -> str:
-    # после take — стараемся получить полный номер
     for key in ("card_full", "card_number", "card", "iban"):
         v = o.get(key)
         if v:
             return str(v)
     return _extract_masked_card(o)
 
-def _fmt_order_line(o: dict) -> str:
+def _fmt_order_line(o: dict, me_username: Optional[str]) -> str:
     eid = o.get("external_order_id") or o.get("id")
-    return f"{eid}: @{o.get('maker')} | USDT {o.get('amount_usdt')}"
+    maker = f"@{o.get('maker')}" if o.get("maker") else "@maker"
+    usdt = o.get("amount_usdt")
+    uah  = o.get("amount_uah")
+    rate = _rate(o)
+    masked = _extract_masked_card(o)
+    tb = str(o.get("taken_by") or "")
+    mine = bool(me_username and (tb == me_username))
+    rem = o.get("remaining_uah")
+    rem_part = f" | Ост: {rem}" if rem else ""
+    base = f"{eid}: {maker} | USDT {usdt} | UAH {uah} | Курс {rate:.2f} | Карта {masked}{rem_part}"
+    if mine:
+        base = "⭐ " + base
+    return base
 
-def _page_kb(prefix: str, page: int, total: int) -> InlineKeyboardMarkup:
-    buttons = []
+def _page_kb(prefix: str, page: int, total: int) -> List[InlineKeyboardButton]:
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("« Назад", callback_data=f"{prefix}:page:{page-1}"))
     if (page + 1) * PAGE_SIZE < total:
         nav.append(InlineKeyboardButton("Вперёд »", callback_data=f"{prefix}:page:{page+1}"))
-    if nav:
-        buttons.append(nav)
-    return InlineKeyboardMarkup(buttons) if buttons else InlineKeyboardMarkup([])
+    return nav
 
 # ───────────────────────── CSRF helpers ──────────────────────
 def _get_csrf_token(session: requests.Session) -> Optional[str]:
@@ -218,11 +230,21 @@ def api_me(session: requests.Session) -> Optional[dict]:
         logger.error("api_me error: %s", e)
     return None
 
-def api_get_free_orders(session: requests.Session) -> List[dict]:
-    # при необходимости поменяй параметр на awaiting_payment
-    url = f"{BASE_URL}/api/orders/?status=pending"
-    items = _fetch_paginated(session, url)
-    return [o for o in items if not o.get("taken_by") and _norm_status(o.get("status")) in FREE_STATUSES]
+def api_get_orders_by_status(session: requests.Session, status: str) -> List[dict]:
+    url = f"{BASE_URL}/api/orders/?status={status}"
+    return _fetch_paginated(session, url)
+
+def api_get_available_orders(session: requests.Session) -> List[dict]:
+    # только pending и не взятые
+    items = api_get_orders_by_status(session, "pending")
+    out = [o for o in items if not o.get("taken_by")]
+    return out
+
+def api_get_my_active_orders(session: requests.Session, me_username: str) -> List[dict]:
+    taken = api_get_orders_by_status(session, "taken")
+    pp    = api_get_orders_by_status(session, "partially_paid")
+    mine = [o for o in (taken + pp) if str(o.get("taken_by") or "") == me_username]
+    return mine
 
 def api_get_order(session: requests.Session, order_id: int) -> Optional[dict]:
     try:
@@ -257,7 +279,7 @@ def api_mark_paid(session: requests.Session, order_id: int) -> Tuple[bool, str]:
             return True, "Оплата отмечена."
     except Exception as e:
         logger.error("mark_paid error: %s", e)
-    # Фолбэк (если нет экшена) — коммент в карточке
+    # fallback: comment
     try:
         rr = session.post(
             f"{BASE_URL}/api/messages/",
@@ -270,6 +292,32 @@ def api_mark_paid(session: requests.Session, order_id: int) -> Tuple[bool, str]:
     except Exception:
         pass
     return False, "Не удалось отметить оплату."
+
+def api_partial_pay(session: requests.Session, order_id: int, amount: str) -> Tuple[bool, str, Optional[dict]]:
+    headers = _csrf_headers(session)
+    try:
+        r = session.post(f"{BASE_URL}/api/orders/{order_id}/partial-pay/",
+                         json={"amount": amount}, headers=headers, timeout=15)
+        if r.ok:
+            return True, "Частичная оплата учтена.", r.json()
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return False, f"{r.status_code}: {body}", None
+    except Exception as e:
+        return False, str(e), None
+
+def api_cancel_order(session: requests.Session, order_id: int) -> Tuple[bool, str]:
+    """Safe fallback for legacy 'Отменить' button in quick-take flow (if exposed)."""
+    headers = _csrf_headers(session)
+    try:
+        r = session.post(f"{BASE_URL}/api/orders/{order_id}/cancel/", headers=headers, timeout=15)
+        if r.ok:
+            return True, "Ордер отменён."
+        return False, f"{r.status_code}: {r.text}"
+    except Exception as e:
+        return False, str(e)
 
 def api_export_orders_csv(session: requests.Session) -> Optional[bytes]:
     try:
@@ -311,17 +359,6 @@ def api_request_withdrawal(session: requests.Session, maker_id: int, address: st
         logger.error("withdraw error: %s", e)
     return False, "Ошибка при запросе вывода."
 
-def api_notifications_since(session: requests.Session, since_id: int) -> List[dict]:
-    try:
-        r = session.get(f"{BASE_URL}/api/notifications/", params={"since": since_id}, timeout=15)
-        if r.ok:
-            body = r.json() or {}
-            return body.get("notifications", [])
-        logger.error("notifications failed: %s %s", r.status_code, r.text)
-    except Exception as e:
-        logger.error("notif error: %s", e)
-    return []
-
 # ───────────────────────── Handlers ──────────────────────────
 def start(update: Update, context: CallbackContext) -> int:
     chat_id = update.effective_chat.id
@@ -356,13 +393,6 @@ def handle_password(update: Update, context: CallbackContext) -> int:
     user_roles[chat_id] = "taker"
     last_notif_id[chat_id] = 0
 
-    # notifications
-    job_name = f"notif_{chat_id}"
-    for job in context.job_queue.get_jobs_by_name(job_name):
-        job.schedule_removal()
-    context.job_queue.run_repeating(poll_notifications, interval=5, first=5,
-                                    context={"chat_id": chat_id}, name=job_name)
-
     update.message.reply_text(
         f"Успешный вход как тейкер @{username}. Используйте /menu для команд.",
         reply_markup=ReplyKeyboardRemove(),
@@ -371,9 +401,9 @@ def handle_password(update: Update, context: CallbackContext) -> int:
 
 def show_menu(update: Update, context: CallbackContext) -> int:
     keyboard = [
-        ["Свободные ордера", "Quick take"],
-        ["Скачать CSV", "Запросить вывод"],
-        ["Logout"],
+        ["Доступные ордера", "Мои активные ордера"],
+        ["Quick take", "Скачать CSV"],
+        ["Запросить вывод", "Logout"],
     ]
     update.message.reply_text(
         "Выберите действие:",
@@ -387,33 +417,75 @@ def logout(update: Update, context: CallbackContext) -> int:
     for job in context.job_queue.get_jobs_by_name(job_name):
         job.schedule_removal()
     for d in (user_sessions, user_roles, last_notif_id, candidates_by_chat,
-              cache_free_orders, current_order_id, user_selected_maker):
+              cache_available_orders, current_order_id, user_selected_maker):
         d.pop(chat_id, None)
     update.message.reply_text("Вы вышли из системы.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-# ────────────── Свободные ордера (список + пагинация) ────────
-def cmd_free_orders(update: Update, context: CallbackContext):
+# ────────────── Доступные ордера (только pending & not taken) ────────
+def cmd_available_orders(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     session = user_sessions.get(chat_id)
     if not session:
         update.message.reply_text("Сначала войдите: /start")
         return STATE_MENU
-    items = api_get_free_orders(session)
-    items.sort(key=_order_sort_key)
-    cache_free_orders[chat_id] = items
+
+    me = api_me(session) or {}
+    me_username = me.get("username")
+
+    free = api_get_available_orders(session)  # только pending & not taken
+    items = sorted(free, key=_order_sort_key, reverse=True)
+
+    cache_available_orders[chat_id] = items
+
     if not items:
-        update.message.reply_text("Свободных ордеров нет.")
+        update.message.reply_text("Доступных (pending) ордеров нет.")
         return STATE_MENU
-    _send_orders_page(update, chat_id, items, page=0, prefix="free")
+
+    _send_available_page(update, chat_id, items, page=0, me_username=me_username, prefix="avail")
     return STATE_MENU
 
-def _send_orders_page(update_or_query, chat_id: int, items: List[dict], page: int, prefix: str):
+# ────────────── Мои активные ордера (taken/partially_paid) ───────────
+def cmd_my_active_orders(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    session = user_sessions.get(chat_id)
+    if not session:
+        update.message.reply_text("Сначала войдите: /start")
+        return STATE_MENU
+
+    me = api_me(session) or {}
+    me_username = me.get("username") or ""
+    items = api_get_my_active_orders(session, me_username)
+    items = sorted(items, key=_order_sort_key, reverse=True)
+
+    cache_available_orders[chat_id] = items  # переиспользуем кэш/пагинацию
+    if not items:
+        update.message.reply_text("У вас нет активных ордеров.")
+        return STATE_MENU
+
+    _send_available_page(update, chat_id, items, page=0, me_username=me_username, prefix="myact")
+    return STATE_MENU
+
+# ────────────── Общая страница листинга (с пагинацией) ───────────────
+def _send_available_page(update_or_query, chat_id: int, items: List[dict], page: int,
+                         me_username: Optional[str], prefix: str):
     start = page * PAGE_SIZE
     end = min(len(items), start + PAGE_SIZE)
-    lines = [ _fmt_order_line(o) for o in items[start:end] ]
-    kb = _page_kb(prefix, page, total=len(items))
-    text = "Свободные ордера:\n" + ("\n".join(lines) if lines else "—")
+
+    kb_rows = []
+    # Per-order buttons
+    for o in items[start:end]:
+        label = _fmt_order_line(o, me_username)
+        kb_rows.append([InlineKeyboardButton(label, callback_data=f"ord:{o.get('id')}")])
+
+    # Navigation
+    nav = _page_kb(prefix, page, total=len(items))
+    if nav:
+        kb_rows.append(nav)
+
+    kb = InlineKeyboardMarkup(kb_rows)
+
+    text = "Доступные ордера:\n" if prefix == "avail" else "Мои активные ордера:\n"
     if isinstance(update_or_query, Update) and update_or_query.message:
         update_or_query.message.reply_text(text, reply_markup=kb)
     else:
@@ -423,14 +495,155 @@ def cb_page(update: Update, context: CallbackContext):
     query = update.callback_query
     chat_id = update.effective_chat.id
     query.answer()
-    data = query.data  # e.g., "free:page:1"
+    data = query.data  # e.g., "avail:page:1" / "myact:page:2"
     try:
         prefix, _, spage = data.split(":")
         page = int(spage)
     except Exception:
         return
-    items = cache_free_orders.get(chat_id, [])
-    _send_orders_page(query, chat_id, items, page, prefix)
+    items = cache_available_orders.get(chat_id, [])
+    # need me_username for labeling
+    session = user_sessions.get(chat_id)
+    me = api_me(session) or {}
+    me_username = me.get("username")
+    _send_available_page(query, chat_id, items, page, me_username, prefix)
+
+def cb_open_order(update: Update, context: CallbackContext):
+    q = update.callback_query
+    q.answer()
+    chat_id = update.effective_chat.id
+    s = user_sessions.get(chat_id)
+    if not s:
+        q.edit_message_text("Сначала войдите: /start")
+        return STATE_MENU
+    try:
+        _, spk = q.data.split(":")
+        oid = int(spk)
+    except Exception:
+        q.edit_message_text("Неверный формат выбора ордера.")
+        return STATE_MENU
+    o = api_get_order(s, oid)
+    if not o:
+        q.edit_message_text("Ордер не найден или недоступен.")
+        return STATE_MENU
+    _bot_show_order_detail(update, context, o)
+    return STATE_VIEW_ORDER
+
+# ───────────────────────── Order view ────────────────────────
+def _bot_show_order_detail(update: Update, context: CallbackContext, order_obj: dict):
+    chat_id = update.effective_chat.id
+    current_order_id[chat_id] = order_obj.get("id")
+
+    me = api_me(user_sessions.get(chat_id) or requests.Session()) or {}
+    me_username = me.get("username") or ""
+
+    status    = _norm_status(order_obj.get("status"))
+    eid       = order_obj.get("external_order_id") or order_obj.get("id")
+    maker     = f"@{order_obj.get('maker')}" if order_obj.get("maker") else "@maker"
+    amt_usdt  = order_obj.get("amount_usdt")
+    amt_uah   = order_obj.get("amount_uah")
+    rate      = _rate(order_obj)
+    masked    = _extract_masked_card(order_obj)
+    full_card = _extract_full_card(order_obj)
+
+    remaining = float(amt_uah) - float(order_obj.get("amount_paid_uah", 0))
+
+    lines = [
+        f"Ордер {eid}",
+        f"Мейкер: {maker}",
+        f"USDT: {amt_usdt} | UAH: {amt_uah} | Курс: {rate:.2f}",
+        f"Карта: {full_card if full_card else masked}",
+        f"Статус: {status}",
+        f"К оплате сейчас: {remaining}",
+    ]
+    text = "\n".join(lines)
+
+    mine = str(order_obj.get("taken_by") or "") == me_username
+    is_free = (status in FREE_STATUSES) and not order_obj.get("taken_by")
+
+    if mine:
+        kb = ReplyKeyboardMarkup([["Оплачено", "Частично оплачено", "Оплатить позже"], ["Назад"]],
+                                 one_time_keyboard=True, resize_keyboard=True)
+    elif is_free:
+        kb = ReplyKeyboardMarkup([["Взять"], ["Назад"]],
+                                 one_time_keyboard=True, resize_keyboard=True)
+    else:
+        kb = ReplyKeyboardMarkup([["Назад"]], one_time_keyboard=True, resize_keyboard=True)
+
+    try:
+        msg = update.message
+    except Exception:
+        msg = None
+    if msg is not None:
+        msg.reply_text(text, reply_markup=kb)
+    else:
+        context.bot.send_message(chat_id, text, reply_markup=kb)
+    return STATE_VIEW_ORDER
+
+def _bot_handle_view_order_action(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    s = user_sessions.get(chat_id)
+    if not s:
+        update.message.reply_text("Сначала войдите: /start")
+        return STATE_MENU
+
+    oid = current_order_id.get(chat_id)
+    if not oid:
+        update.message.reply_text("Ордер не выбран.")
+        return STATE_MENU
+
+    choice = (update.message.text or "").strip()
+    if choice == "Назад":
+        update.message.reply_text("← В меню. /menu", reply_markup=ReplyKeyboardRemove())
+        return STATE_MENU
+
+    if choice == "Оплатить позже":
+        update.message.reply_text("Ок, вернись когда будешь готов.", reply_markup=ReplyKeyboardRemove())
+        return STATE_MENU
+
+    if choice == "Взять":
+        ok, detail, order = api_take_order(s, oid)
+        if not ok:
+            update.message.reply_text(f"Не удалось взять ордер: {detail}", reply_markup=ReplyKeyboardRemove())
+            return STATE_MENU
+        _bot_show_order_detail(update, context, order or api_get_order(s, oid) or {"id": oid})
+        return STATE_VIEW_ORDER
+
+    if choice == "Оплачено":
+        ok, msg = api_mark_paid(s, oid)
+        update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
+        return STATE_MENU
+
+    if choice == "Частично оплачено":
+        update.message.reply_text("Введи сумму частичной оплаты (UAH):")
+        context.user_data["await_partial_for"] = oid
+        return STATE_PARTIAL_AMOUNT
+
+    update.message.reply_text("Не понял выбор.")
+    return STATE_MENU
+
+def _bot_handle_partial_amount(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    s = user_sessions.get(chat_id)
+    oid = context.user_data.get("await_partial_for")
+    amount = (update.message.text or "").strip().replace(",", ".")
+    if not oid:
+        update.message.reply_text("Ордер не выбран.")
+        return STATE_MENU
+    if not re.match(r"^\d+(\.\d+)?$", amount):
+        update.message.reply_text("Неверный формат суммы. Пример: 123.45")
+        return STATE_PARTIAL_AMOUNT
+    ok, msg, body = api_partial_pay(s, oid, amount)
+    if not ok:
+        update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
+        return STATE_MENU
+    # reread order to show updated remaining
+    o = api_get_order(s, oid) or {}
+    update.message.reply_text(
+        f"Частичная оплата учтена. Статус: {o.get('status')}. Остаток: {float(o.get('amount_uah', 0)) - float(o.get('amount_paid_uah', 0))}",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return STATE_MENU
 
 # ───────────────────────── Quick take ────────────────────────
 def quick_take(update: Update, context: CallbackContext) -> int:
@@ -441,12 +654,12 @@ def quick_take(update: Update, context: CallbackContext) -> int:
         update.message.reply_text("Сначала войдите: /start")
         return STATE_MENU
 
-    items = api_get_free_orders(session)
+    items = api_get_available_orders(session)
     if not items:
         update.message.reply_text("Нет доступных ордеров для взятия.")
         return STATE_MENU
 
-    items.sort(key=_order_sort_key)
+    items.sort(key=_order_sort_key, reverse=True)
     candidates_by_chat[chat_id] = items
     return present_next_candidate(update, context)
 
@@ -477,7 +690,6 @@ def present_next_candidate(update: Update, context: CallbackContext) -> int:
         text,
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
     )
-    # сохраним текущего кандидата (ещё не взяли)
     context.user_data["preview_candidate"] = o
     return STATE_QUICK_PREVIEW
 
@@ -503,7 +715,6 @@ def handle_quick_preview_choice(update: Update, context: CallbackContext) -> int
 
         order = order or api_get_order(session, cand.get("id")) or cand
         amt_uah = order.get("amount_uah") or 0
-        amt_usdt = order.get("amount_usdt") or 0
         rate = _rate(order)
         full_card = _extract_full_card(order)
 
@@ -516,7 +727,7 @@ def handle_quick_preview_choice(update: Update, context: CallbackContext) -> int
             f"Карта для оплаты: {full_card}\n"
             f"Сумма к оплате: {amt_uah} UAH | Курс: {rate:.2f}{notice}"
         )
-        keyboard = [["Оплачено", "Отменить"]]
+        keyboard = [["Оплачено"]]
         update.message.reply_text(
             msg,
             reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
@@ -544,12 +755,6 @@ def handle_after_take_action(update: Update, context: CallbackContext) -> int:
 
     if action == "Оплачено":
         ok, msg = api_mark_paid(session, oid)
-        update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
-        current_order_id.pop(chat_id, None)
-        return STATE_MENU
-
-    if action == "Отменить":
-        ok, msg = api_cancel_order(session, oid)
         update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
         current_order_id.pop(chat_id, None)
         return STATE_MENU
@@ -597,7 +802,6 @@ def cb_withdraw_pick_maker(update: Update, context: CallbackContext) -> int:
     query.answer()
     data = query.data  # wd_maker:<id>:<username>
     try:
-        logger.info(data)
         _, maker_id, maker_username = data.split(":", 2)
         maker_id = int(maker_id)
     except Exception:
@@ -623,40 +827,13 @@ def handle_withdraw_address(update: Update, context: CallbackContext) -> int:
     update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
     return STATE_MENU
 
-# ─────────────────────── Notifications poller ───────────────────────────
-def poll_notifications(context: CallbackContext) -> None:
-    job_context = context.job.context
-    chat_id = job_context.get("chat_id")
-    session = user_sessions.get(chat_id)
-    if not session:
-        return
-    last_id = last_notif_id.get(chat_id, 0)
-    try:
-        notifications = api_notifications_since(session, last_id)
-        notifications.reverse()  # oldest first
-        for n in notifications:
-            nid = n.get("id")
-            if nid and nid > last_id:
-                last_notif_id[chat_id] = nid
-            message = n.get("message", "")
-            context.bot.send_message(chat_id=chat_id, text=message)
-
-            # подсказка: связаться с мейкером по ордеру
-            maker_match = re.search(r"@([A-Za-z0-9_]+)", message)
-            order_match = re.search(r"order\\s+([A-Za-zA-Z0-9\\-]+)", message, re.IGNORECASE)
-            maker_user = maker_match.group(1) if maker_match else None
-            order_id = order_match.group(1) if order_match else None
-            if maker_user and order_id:
-                contact = f"Свяжитесь с @{maker_user} по поводу данного ордера ({order_id})"
-                context.bot.send_message(chat_id=chat_id, text=contact)
-    except Exception as e:
-        logger.error("Notification polling error: %s", e)
-
 # ─────────────────────────── Router ──────────────────────────
 def handle_menu_choice(update: Update, context: CallbackContext) -> int:
     text = update.message.text
-    if text == "Свободные ордера":
-        return cmd_free_orders(update, context)
+    if text == "Доступные ордера":
+        return cmd_available_orders(update, context)
+    if text == "Мои активные ордера":
+        return cmd_my_active_orders(update, context)
     if text == "Quick take":
         return quick_take(update, context)
     if text == "Скачать CSV":
@@ -680,23 +857,33 @@ def main() -> None:
         states={
             STATE_USERNAME: [MessageHandler(Filters.text & ~Filters.command, handle_username)],
             STATE_PASSWORD: [MessageHandler(Filters.text & ~Filters.command, handle_password)],
+
             STATE_MENU: [
-                MessageHandler(Filters.text & ~Filters.command, handle_menu_choice),
-                CallbackQueryHandler(cb_page, pattern=r"^(free):page:\d+$"),
+                # Inline callbacks while in menu
+                CallbackQueryHandler(cb_open_order, pattern=r"^ord:\d+$"),
+                CallbackQueryHandler(cb_page, pattern=r"^(avail|myact):page:\d+$"),
                 CallbackQueryHandler(cb_withdraw_pick_maker, pattern=r"^wd_maker:"),
+                # Text menu
+                MessageHandler(Filters.text & ~Filters.command, handle_menu_choice),
             ],
 
-            # Quick take preview → Pay/Next
-            STATE_QUICK_PREVIEW: [MessageHandler(Filters.text & ~Filters.command, handle_quick_preview_choice)],
+            # Available/my order view
+            STATE_VIEW_ORDER: [MessageHandler(Filters.text & ~Filters.command, _bot_handle_view_order_action)],
+            STATE_PARTIAL_AMOUNT: [MessageHandler(Filters.text & ~Filters.command, _bot_handle_partial_amount)],
 
-            # After take → only Paid
+            # Quick take flow
+            STATE_QUICK_PREVIEW: [MessageHandler(Filters.text & ~Filters.command, handle_quick_preview_choice)],
             STATE_AFTER_TAKE_ACTION: [MessageHandler(Filters.text & ~Filters.command, handle_after_take_action)],
 
             # Withdraw
             STATE_WITHDRAW_PICK_MAKER: [CallbackQueryHandler(cb_withdraw_pick_maker, pattern=r"^wd_maker:")],
             STATE_WITHDRAW_ADDRESS: [MessageHandler(Filters.text & ~Filters.command, handle_withdraw_address)],
         },
-        fallbacks=[CommandHandler("logout", logout)],
+        fallbacks=[
+            CommandHandler("logout", logout),
+            CommandHandler("menu", show_menu),
+            MessageHandler(Filters.text & ~Filters.command, fallback_show_menu),
+        ],
         allow_reentry=True,
     )
 
