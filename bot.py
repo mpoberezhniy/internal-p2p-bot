@@ -1,22 +1,3 @@
-"""
-Telegram bot: streamlined taker workflow for internal P2P.
-
-Kept features:
-- login (/start)
-- available orders list with pagination (теперь "Доступные" = только pending & not taken)
-- quick take flow
-- export CSV
-- request withdrawal (pick maker -> TRC20)
-
-Added/updated:
-- Полная строка ордера в списках: USDT/UAH, курс, маска карты, остаток.
-- Новое меню “Мои активные ордера” — ордера текущего тейкера со статусами taken/partially_paid.
-- В деталке ордера показывается “К оплате сейчас” (remaining_uah, иначе amount_uah).
-- В деталке свободного ордера доступна кнопка “Взять”.
-- В деталке активного — “Оплачено”, “Частично оплачено”, “Оплатить позже”.
-- Пагинация поддерживает префиксы страниц для “avail” и “myact”.
-"""
-
 import logging
 import os
 import re
@@ -65,7 +46,9 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
     STATE_WITHDRAW_ADDRESS,     # input TRC20 address
     STATE_VIEW_ORDER,           # view opened order (from available/my orders)
     STATE_PARTIAL_AMOUNT,       # input partial pay amount
-) = range(9)
+    STATE_COMMENT_MENU,         # after pay / partial-pay: menu to add comment or go to menu
+    STATE_COMMENT_TEXT,         # input comment text
+) = range(11)
 
 # ───────────────────── In-memory session data ────────────────
 user_sessions: Dict[int, requests.Session] = {}
@@ -254,6 +237,50 @@ def api_get_order(session: requests.Session, order_id: int) -> Optional[dict]:
     except Exception:
         pass
     return None
+
+
+
+def api_get_order_comments(session: requests.Session, order_id: int) -> dict:
+    """Получить комментарии и вложения ордера через API."""
+    try:
+        r = session.get(f"{BASE_URL}/api/order/{order_id}/comments/", timeout=15)
+        if r.ok:
+            return r.json()
+    except Exception as e:
+        logger.error("order_comments error: %s", e)
+    # единый формат ответа
+    return {"results": [], "order_attachments": []}
+
+
+def api_add_order_comment(session: requests.Session, order_id: int, text: str, files: Optional[List[Tuple[str, Tuple[str, BytesIO, str]]]] = None) -> Tuple[bool, str]:
+    """Добавить комментарий к ордеру через API (с текстом и/или файлами)."""
+    headers = _csrf_headers(session)
+    try:
+        kwargs = {
+            "headers": headers,
+            "timeout": 15,
+        }
+        # Всегда передаём текст (может быть пустой строкой)
+        data = {"text": text or "Файл добавлен."}
+        if files:
+            kwargs["data"] = data
+            kwargs["files"] = files
+        else:
+            kwargs["data"] = data
+        r = session.post(
+            f"{BASE_URL}/api/order/{order_id}/comments/",
+            **kwargs,
+        )
+        if r.ok:
+            return True, "Комментарий добавлен."
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return False, f"{r.status_code}: {body}"
+    except Exception as e:
+        logger.error("add_comment error: %s", e)
+        return False, "Ошибка при добавлении комментария."
 
 def api_take_order(session: requests.Session, order_id: int) -> Tuple[bool, str, Optional[dict]]:
     try:
@@ -548,18 +575,34 @@ def _bot_show_order_detail(update: Update, context: CallbackContext, order_obj: 
 
     remaining = float(amt_uah) - float(order_obj.get("amount_paid_uah", 0))
 
+    mine = str(order_obj.get("taken_by") or "") == me_username
+    is_free = (status in FREE_STATUSES) and not order_obj.get("taken_by")
+
     lines = [
         f"Ордер {eid}",
         f"Мейкер: {maker}",
         f"USDT: {amt_usdt} | UAH: {amt_uah} | Курс: {rate:.2f}",
-        f"Карта: {full_card if full_card else masked}",
+        f"Карта: {full_card if mine else masked}",
         f"Статус: {status}",
         f"К оплате сейчас: {remaining}",
     ]
-    text = "\n".join(lines)
 
-    mine = str(order_obj.get("taken_by") or "") == me_username
-    is_free = (status in FREE_STATUSES) and not order_obj.get("taken_by")
+    # добавить пару пустых строк и комментарии по ордеру (если есть)
+    session = user_sessions.get(chat_id)
+    if session:
+        comments_data = api_get_order_comments(session, order_obj.get("id"))
+        comments = (comments_data or {}).get("results") or []
+        if comments:
+            lines.append("")
+            lines.append("")
+            lines.append("Комментарии (5 последних):")
+            # показываем последние несколько комментариев
+            for c in comments[-5:]:
+                uname = c.get("username") or f"id {c.get('user_id')}"
+                text_c = c.get("text") or ""
+                lines.append(f"- @{uname}: {text_c}")
+
+    text = "\n".join(lines)
 
     if mine:
         kb = ReplyKeyboardMarkup([["Оплачено", "Частично оплачено", "Оплатить позже"], ["Назад"]],
@@ -611,8 +654,19 @@ def _bot_handle_view_order_action(update: Update, context: CallbackContext):
 
     if choice == "Оплачено":
         ok, msg = api_mark_paid(s, oid)
-        update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
-        return STATE_MENU
+        if not ok:
+            update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
+            return STATE_MENU
+        # после отметки оплаты предлагаем оставить комментарий
+        update.message.reply_text(
+            msg + "\n\nМожешь оставить комментарий к ордеру.",
+            reply_markup=ReplyKeyboardMarkup(
+                [["Оставить комментарий", "В меню"]],
+                one_time_keyboard=True,
+                resize_keyboard=True,
+            ),
+        )
+        return STATE_COMMENT_MENU
 
     if choice == "Частично оплачено":
         update.message.reply_text("Введи сумму частичной оплаты (UAH):")
@@ -639,13 +693,107 @@ def _bot_handle_partial_amount(update: Update, context: CallbackContext):
         return STATE_MENU
     # reread order to show updated remaining
     o = api_get_order(s, oid) or {}
+    remaining = float(o.get("amount_uah", 0)) - float(o.get("amount_paid_uah", 0))
     update.message.reply_text(
-        f"Частичная оплата учтена. Статус: {o.get('status')}. Остаток: {float(o.get('amount_uah', 0)) - float(o.get('amount_paid_uah', 0))}",
-        reply_markup=ReplyKeyboardRemove()
+        f"Частичная оплата учтена. Статус: {o.get('status')}. Остаток: {remaining}",
     )
-    return STATE_MENU
+    update.message.reply_text(
+        "Можешь оставить комментарий к ордеру.",
+        reply_markup=ReplyKeyboardMarkup(
+            [["Оставить комментарий", "В меню"]],
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        ),
+    )
+    return STATE_COMMENT_MENU
 
 # ───────────────────────── Quick take ────────────────────────
+
+
+def _bot_handle_comment_menu(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    choice = (update.message.text or "").strip()
+    if choice == "В меню":
+        update.message.reply_text("Возвращаемся в меню. /menu", reply_markup=ReplyKeyboardRemove())
+        return STATE_MENU
+    if choice == "Оставить комментарий":
+        oid = current_order_id.get(chat_id)
+        if not oid:
+            update.message.reply_text("Ордер не выбран.", reply_markup=ReplyKeyboardRemove())
+            return STATE_MENU
+        update.message.reply_text("Отправь текст комментария:", reply_markup=ReplyKeyboardRemove())
+        return STATE_COMMENT_TEXT
+    update.message.reply_text("Пожалуйста, выбери 'Оставить комментарий' или 'В меню'.")
+    return STATE_COMMENT_MENU
+
+
+def _bot_handle_comment_text(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    session = user_sessions.get(chat_id)
+    if not session:
+        update.message.reply_text("Сначала войдите: /start", reply_markup=ReplyKeyboardRemove())
+        return STATE_MENU
+    oid = current_order_id.get(chat_id)
+    if not oid:
+        update.message.reply_text("Ордер не выбран.", reply_markup=ReplyKeyboardRemove())
+        return STATE_MENU
+
+    msg = update.message
+
+    # текст берём из text или из caption (для фото/документа)
+    text = (msg.caption or msg.text or "").strip()
+
+    files = []
+
+    # фото
+    if msg.photo:
+        # берём самое крупное фото
+        photo = msg.photo[-1]
+        try:
+            tg_file = photo.get_file()
+            bio = BytesIO()
+            tg_file.download(out=bio)
+            bio.seek(0)
+            filename = f"photo_{tg_file.file_unique_id}.jpg"
+            files.append(("file", (filename, bio, "image/jpeg")))
+        except Exception as e:
+            logger.error("download photo for comment failed: %s", e)
+
+    # документ
+    if msg.document:
+        try:
+            tg_file = msg.document.get_file()
+            bio = BytesIO()
+            tg_file.download(out=bio)
+            bio.seek(0)
+            filename = msg.document.file_name or f"file_{tg_file.file_unique_id}"
+            mime = msg.document.mime_type or "application/octet-stream"
+            files.append(("file", (filename, bio, mime)))
+        except Exception as e:
+            logger.error("download document for comment failed: %s", e)
+
+    if not text and not files:
+        update.message.reply_text("Комментарий не может быть пустым, отправь текст или файл/фото.")
+        return STATE_COMMENT_TEXT
+
+    ok, msg_resp = api_add_order_comment(session, oid, text, files=files or None)
+    if not ok:
+        # msg_resp может быть очень длинным (HTML-страница ошибки и т.п.), режем до безопасной длины
+        safe_msg = (msg_resp or "")
+        if len(safe_msg) > 1000:
+            safe_msg = safe_msg[:1000] + "…"
+        update.message.reply_text(safe_msg, reply_markup=ReplyKeyboardRemove())
+        return STATE_MENU
+    update.message.reply_text(
+        "Комментарий добавлен.\n\nМожешь добавить ещё или вернуться в меню.",
+        reply_markup=ReplyKeyboardMarkup(
+            [["Оставить комментарий", "В меню"]],
+            one_time_keyboard=True,
+            resize_keyboard=True,
+        ),
+    )
+    return STATE_COMMENT_MENU
+
 def quick_take(update: Update, context: CallbackContext) -> int:
     """Stage 1: preview candidate (masked card + rate) with choice."""
     chat_id = update.effective_chat.id
@@ -870,10 +1018,12 @@ def main() -> None:
             # Available/my order view
             STATE_VIEW_ORDER: [MessageHandler(Filters.text & ~Filters.command, _bot_handle_view_order_action)],
             STATE_PARTIAL_AMOUNT: [MessageHandler(Filters.text & ~Filters.command, _bot_handle_partial_amount)],
+            STATE_COMMENT_MENU: [MessageHandler(Filters.text & ~Filters.command, _bot_handle_comment_menu)],
+            STATE_COMMENT_MENU: [MessageHandler(Filters.text & ~Filters.command, _bot_handle_comment_menu)],
+            STATE_COMMENT_TEXT: [MessageHandler((Filters.text | Filters.photo | Filters.document) & ~Filters.command, _bot_handle_comment_text)],
 
             # Quick take flow
             STATE_QUICK_PREVIEW: [MessageHandler(Filters.text & ~Filters.command, handle_quick_preview_choice)],
-            STATE_AFTER_TAKE_ACTION: [MessageHandler(Filters.text & ~Filters.command, handle_after_take_action)],
 
             # Withdraw
             STATE_WITHDRAW_PICK_MAKER: [CallbackQueryHandler(cb_withdraw_pick_maker, pattern=r"^wd_maker:")],

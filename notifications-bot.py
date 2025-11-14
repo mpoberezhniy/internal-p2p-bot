@@ -1,4 +1,3 @@
-# internal-p2p-notifications-bot.py
 import os, re, logging, requests
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
@@ -6,7 +5,7 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Callb
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("p2p-notif-bot")
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # токен ЭТОГО бота (уведомления)
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 
 STATE_USERNAME, STATE_PASSWORD, STATE_RUNNING = range(3)
@@ -49,6 +48,51 @@ def api_notifications_since(s: requests.Session, since: int):
     except Exception:
         pass
     return []
+
+
+
+def api_order_comments(s: requests.Session, order_id: int):
+    """Получить комментарии и вложения ордера для вывода в уведомлениях."""
+    try:
+        r = s.get(f"{BASE_URL}/api/order/{order_id}/comments/", timeout=15)
+        if r.ok:
+            return r.json() or {}
+    except Exception as e:
+        log.error("order_comments error: %s", e)
+    return {"results": [], "order_attachments": []}
+
+
+def _extract_order_id_from_url(url: str):
+    """Вытащить pk ордера из Notification.url вида /order/<pk>/"""
+    if not url:
+        return None
+    m = re.search(r"/order/(\d+)/", url)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _format_comments_block(data):
+    """Сформировать текстовый блок с последними комментариями к ордеру."""
+    comments = (data or {}).get("results") or []
+    if not comments:
+        return None
+    # берём последние несколько, чтобы не заспамить
+    lines = ["", "", "Комментарии по ордеру:"]
+    for c in comments:
+        uname = c.get("username") or f"id {c.get('user_id')}"
+        text = (c.get("text") or "").strip()
+        if len(text) > 300:
+            text = text[:300] + "…"
+        lines.append(f"- {uname}: {text}")
+    block = "\n".join(lines)
+    # подстрахуемся от переполнения лимита Telegram
+    if len(block) > 1500:
+        block = block[:1500] + "…"
+    return block
 
 def start(update: Update, _):
     if update.effective_chat.id in sessions:
@@ -97,7 +141,27 @@ def poll_notifications(context: CallbackContext):
         if nid > last_id:
             last_notif_id[chat_id] = nid
         msg = n.get("message", "")
-        context.bot.send_message(chat_id, msg)
+        # основное уведомление
+        final_msg = msg
+
+        # если это уведомление о завершённом ордере для тейкера – подтягиваем комментарии
+        msg_low = msg.lower()
+        logging.info(msg_low)
+        if "confirmed payment for order" in msg_low:
+            logging.info("confirmed payment for order" in msg_low)
+            url = n.get("url", "")
+            order_id = _extract_order_id_from_url(url)
+            logging.info(order_id)
+            if order_id:
+                data = api_order_comments(s, order_id)
+                logging.info(str(data))
+                block = _format_comments_block(data)
+                if block:
+                    final_msg += block
+        try:
+            context.bot.send_message(chat_id, final_msg)
+        except Exception as e:
+            log.error("send notification failed: %s", e)
 
 def stop(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
