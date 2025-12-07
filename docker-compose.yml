@@ -19,3 +19,13 @@ services:
       - BASE_URL=${BASE_URL:-http://localhost:8000}
     command: python notifications-bot.py
     restart: unless-stopped
+  profits_bot:
+    build: .
+    network_mode: host
+    container_name: profits_bot
+    environment:
+      - BOT_TOKEN=8322988997:AAGsJnREyxa0O3bbtzFGHCbVIoJoxQHSUHo
+      - BASE_URL=${BASE_URL:-http://localhost:8000}
+    command: python profits-bot.py
+    restart: unless-stopped
+
