@@ -88,6 +88,36 @@ def aggregate_trades_binance(trades: List[dict]) -> Tuple[Decimal, Decimal]:
         total_fiat += total_price
     return total_fiat, total_crypto
 
+def aggregate_cancelled_trades_binance(trades: List[dict]) -> Tuple[int, Decimal]:
+    """Считает количество и объем (в USDT) отмененных SELL-ордеров в Binance P2P.
+
+    Binance C2C trade history возвращает orderStatus, где для отмен:
+      - CANCELLED
+      - CANCELLED_BY_SYSTEM
+    (держим также CANCELED/CANCELED_BY_SYSTEM на всякий случай).
+    """
+    cancelled_statuses = {
+        "CANCELLED",
+        "CANCELLED_BY_SYSTEM",
+    }
+    cnt = 0
+    total_crypto = Decimal("0")
+    for t in trades:
+        if t.get("asset") != ASSET:
+            continue
+        if t.get("fiat") != FIAT:
+            continue
+        if t.get("orderStatus") not in cancelled_statuses:
+            continue
+        try:
+            amount = Decimal(str(t.get("amount", "0")))
+        except Exception:
+            amount = Decimal("0")
+        cnt += 1
+        total_crypto += amount
+    return cnt, total_crypto
+
+
 
 def get_binance_sell_trades(
     client: Client,
@@ -222,12 +252,15 @@ def format_profit_message(
     rows_count: int,
     sold_fiat: Decimal,
     sold_crypto: Decimal,
+    cancelled_orders: int,
+    cancelled_usdt: Decimal,
 ) -> str:
     if bought_crypto == 0 or sold_crypto == 0:
         return (
             "Нет достаточных данных для расчёта.\n"
             f"BUY (internal CSV): строк={rows_count}, USDT={bought_crypto}, UAH={bought_fiat}\n"
-            f"SELL (Binance): USDT={sold_crypto}, UAH={sold_fiat}"
+            f"SELL (Binance): USDT={sold_crypto}, UAH={sold_fiat}\n"
+            f"CANCELLED SELL orders: count={cancelled_orders}, USDT={cancelled_usdt}"
         )
 
     try:
@@ -244,7 +277,8 @@ def format_profit_message(
         return (
             "Не удалось корректно посчитать средние цены.\n"
             f"BUY: USDT={bought_crypto}, UAH={bought_fiat}\n"
-            f"SELL: USDT={sold_crypto}, UAH={sold_fiat}"
+            f"SELL: USDT={sold_crypto}, UAH={sold_fiat}\n"
+            f"CANCELLED SELL orders: count={cancelled_orders}, USDT={cancelled_usdt}"
         )
 
     profit_rate = avg_sell_rate / avg_buy_rate
@@ -264,6 +298,10 @@ def format_profit_message(
         f"  USDT:  {sold_crypto}",
         f"  UAH:   {sold_fiat}",
         f"  avg SELL rate: {avg_sell_rate} UAH/USDT",
+        "",
+        f"CANCELLED SELL orders (Binance P2P):",
+        f"  count: {cancelled_orders}",
+        f"  USDT:  {cancelled_usdt}",
         "",
         f"Profit rate:   {profit_rate}",
         f"Profit amount: {profit_amount} USDT",
@@ -394,6 +432,7 @@ def profit(update: Update, context: CallbackContext) -> None:
         sell_client = Client(BINANCE_API_KEY_SELL, BINANCE_API_SECRET_SELL)
         sell_trades = get_binance_sell_trades(sell_client, start_dt, end_dt)
         sold_fiat, sold_crypto = aggregate_trades_binance(sell_trades)
+        cancelled_orders, cancelled_usdt = aggregate_cancelled_trades_binance(sell_trades)
 
     except Exception as e:
         logger.exception("Error during profit calculation")
@@ -408,6 +447,8 @@ def profit(update: Update, context: CallbackContext) -> None:
         rows_count,
         sold_fiat,
         sold_crypto,
+        cancelled_orders,
+        cancelled_usdt,
     )
     update.message.reply_text(msg)
 
@@ -533,6 +574,7 @@ def profitw_done(update: Update, context: CallbackContext) -> int:
         sell_client = Client(BINANCE_API_KEY_SELL, BINANCE_API_SECRET_SELL)
         sell_trades = get_binance_sell_trades(sell_client, start_dt, end_dt)
         sold_fiat, sold_crypto = aggregate_trades_binance(sell_trades)
+        cancelled_orders, cancelled_usdt = aggregate_cancelled_trades_binance(sell_trades)
 
     except Exception as e:
         logger.exception("Error during profitw calculation")
@@ -547,6 +589,8 @@ def profitw_done(update: Update, context: CallbackContext) -> int:
         rows_count,
         sold_fiat,
         sold_crypto,
+        cancelled_orders,
+        cancelled_usdt,
     )
     update.message.reply_text(msg)
     return ConversationHandler.END
