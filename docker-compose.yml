@@ -28,4 +28,12 @@ services:
       - BASE_URL=${BASE_URL:-http://localhost:8000}
     command: python profits-bot.py
     restart: unless-stopped
-
+  remainders_bot:
+    build: .
+    network_mode: host
+    container_name: remainders_bot
+    environment:
+      - BOT_TOKEN=7355216609:AAHfpxhkv5d5IHBnRJIuWtyFAkrVGxVj2Fw
+      - BASE_URL=${BASE_URL:-http://localhost:8000}
+    command: python remainders-bot.py
+    restart: unless-stopped
