@@ -35,17 +35,19 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
     STATE_USERNAME,
     STATE_PASSWORD,
     STATE_MENU,
-    STATE_WAIT_RECEIPT,
-) = range(4)
+    STATE_WAIT_RECEIPT_FILE,
+    STATE_WAIT_CARD,
+) = range(5)
 
 # In-memory per-chat session state
 user_sessions: Dict[int, requests.Session] = {}
-pending_receipt_order: Dict[int, int] = {}  # chat_id -> order_id
+pending_paid_orders: Dict[int, set] = {}  # chat_id -> set(order_id) marked as paid and waiting for receipt
+pending_receipt_blob: Dict[int, tuple] = {}  # chat_id -> (filename, BytesIO, mime) waiting to be attached
 
 
 def _menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["Доступные остатки"], ["/logout"]],
+        [["Доступные остатки", "Прикрепить квитанцию"], ["\/logout"]],
         resize_keyboard=True,
     )
 
@@ -146,20 +148,35 @@ def _fetch_order_detail(session: requests.Session, order_id: int) -> dict:
     return r.json() or {}
 
 
-def _upload_receipt_to_order(
-    session: requests.Session, order_id: int, filename: str, file_bytes: bytes
-) -> None:
-    files = {"file": (filename, file_bytes)}
-    data = {"text": "Квитанция по оплате остатка"}
-    r = session.post(
-        f"{BASE_URL}/api/order/{order_id}/comments/",
-        data=data,
-        files=files,
-        headers=_csrf_headers(session),
-        timeout=40,
-    )
-    if not r.ok:
-        raise RuntimeError(f"Upload receipt failed: {r.status_code} {r.text}")
+def api_add_order_comment(session: requests.Session, order_id: int, text: str, files=None) -> Tuple[bool, str]:
+    """Как в bot.py: добавить комментарий к ордеру с текстом и/или файлами."""
+    headers = _csrf_headers(session)
+    try:
+        kwargs = {"headers": headers, "timeout": 40}
+        data = {"text": text or "Файл добавлен."}
+        kwargs["data"] = data
+        if files:
+            kwargs["files"] = files
+        r = session.post(f"{BASE_URL}/api/order/{order_id}/comments/", **kwargs)
+        if r.ok:
+            return True, "OK"
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text
+        return False, f"{r.status_code}: {body}"
+    except Exception as e:
+        logger.error("add_comment error: %s", e)
+        return False, str(e)
+
+
+def _upload_receipt_to_order(session: requests.Session, order_id: int, filename: str, bio: BytesIO, mime: str) -> None:
+    bio.seek(0)
+    files = [("file", (filename, bio, mime or "application/octet-stream"))]
+    ok, msg = api_add_order_comment(session, order_id, "Квитанция по оплате остатка", files=files)
+    if not ok:
+        raise RuntimeError(f"Upload receipt failed: {msg}")
+
 
 
 # ───────────────────────── Handlers ────────────────────────────
@@ -201,7 +218,8 @@ def on_password(update: Update, context: CallbackContext):
 def logout(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     user_sessions.pop(chat_id, None)
-    pending_receipt_order.pop(chat_id, None)
+    pending_paid_orders.pop(chat_id, None)
+    pending_receipt_blob.pop(chat_id, None)
     update.message.reply_text(
         "Вышел. /start чтобы войти снова.", reply_markup=ReplyKeyboardRemove()
     )
@@ -319,15 +337,19 @@ def remainders_callback(update: Update, context: CallbackContext):
         ext = str(od.get("external_order_id") or order_id)
         amount_uah = reserved_uah or str(od.get("remaining_uah") or "")
 
+        # Считаем, что если реквизиты показаны — оплата уже начата и мы ждём квитанцию.
+        pending_paid_orders.setdefault(chat_id, set()).add(order_id)
+
+
         text = (
             f"Ордер: {ext}\n"
             f"Сумма остатка: {amount_uah} грн\n"
             f"Банк: {bank}\n"
             f"Карта: {card_full}\n\n"
-            f"После оплаты нажми «Оплачено» и прикрепи квитанцию."
+            f"Квитанцию прикрепи через меню: «Прикрепить квитанцию»."
         )
         kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Оплачено", callback_data=f"rem:paid:{order_id}")]]
+            [[InlineKeyboardButton("В меню", callback_data="rem:menu")]]
         )
         query.edit_message_text(text, reply_markup=kb)
         return STATE_MENU
@@ -339,64 +361,225 @@ def remainders_callback(update: Update, context: CallbackContext):
             query.edit_message_text("Некорректный order_id")
             return STATE_MENU
 
-        pending_receipt_order[chat_id] = order_id
-        query.edit_message_text("Отправь квитанцию (фото или файл).")
-        return STATE_WAIT_RECEIPT
+        pending_paid_orders.setdefault(chat_id, set()).add(order_id)
+        query.edit_message_text(
+            "Отметил как оплачено. Можешь оплатить другие остатки параллельно.\n\n"
+            "Когда будет квитанция — открой меню и нажми «Прикрепить квитанцию».",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("В меню", callback_data="rem:menu")]]
+            ),
+        )
+        return STATE_MENU
+
+    if data == "rem:menu":
+        query.edit_message_text("Меню")
+        context.bot.send_message(chat_id=chat_id, text="Выбери действие:", reply_markup=_menu_kb())
+        return STATE_MENU
+
+    if data.startswith("rem:attach:"):
+        try:
+            oid = int(data.split(":")[-1])
+        except Exception:
+            query.edit_message_text("Некорректный order_id")
+            return STATE_MENU
+
+        blob = pending_receipt_blob.get(chat_id)
+        if not blob:
+            query.edit_message_text("Нет квитанции. Нажми «Прикрепить квитанцию» и пришли файл.")
+            return STATE_MENU
+
+        filename, bio, mime = blob
+        try:
+            _upload_receipt_to_order(s, oid, filename, bio, mime)
+        except Exception as e:
+            query.edit_message_text(f"Не удалось прикрепить квитанцию: {e}")
+            return STATE_MENU
+
+        pending_receipt_blob.pop(chat_id, None)
+        if pending_paid_orders.get(chat_id):
+            pending_paid_orders[chat_id].discard(oid)
+        query.edit_message_text(f"Квитанция прикреплена к ордеру #{oid}.")
+        context.bot.send_message(chat_id=chat_id, text="Выбери действие:", reply_markup=_menu_kb())
+        return STATE_MENU
 
     query.edit_message_text("Неизвестная команда.")
     return STATE_MENU
 
 
-def on_receipt(update: Update, context: CallbackContext):
+def _digits(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+
+def show_menu(update: Update, context: CallbackContext):
+    # Just re-show menu keyboard
+    if update.message:
+        update.message.reply_text("Выбери действие:", reply_markup=_menu_kb())
+    return STATE_MENU
+
+
+def start_attach_receipt(update: Update, context: CallbackContext):
+    s = _ensure_session(update)
+    if not s:
+        return ConversationHandler.END
+    update.message.reply_text(
+        "Пришли квитанцию (фото или файл).",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return STATE_WAIT_RECEIPT_FILE
+
+
+def on_receipt_file(update: Update, context: CallbackContext):
     s = _ensure_session(update)
     if not s:
         return ConversationHandler.END
 
     chat_id = update.effective_chat.id
-    order_id = pending_receipt_order.get(chat_id)
-    if not order_id:
+    msg = update.message
+
+    files = []
+    filename = "receipt.bin"
+    mime = "application/octet-stream"
+    bio = BytesIO()
+
+    try:
+        if msg.photo:
+            photo = msg.photo[-1]
+            tg_file = photo.get_file()
+            tg_file.download(out=bio)
+            bio.seek(0)
+            filename = f"receipt_{tg_file.file_unique_id}.jpg"
+            mime = "image/jpeg"
+        elif msg.document:
+            doc = msg.document
+            tg_file = doc.get_file()
+            tg_file.download(out=bio)
+            bio.seek(0)
+            filename = doc.file_name or f"receipt_{tg_file.file_unique_id}"
+            mime = doc.mime_type or "application/octet-stream"
+        else:
+            msg.reply_text("Пришли фото или файл (document).", reply_markup=_menu_kb())
+            return STATE_MENU
+    except Exception as e:
+        msg.reply_text(f"Не смог скачать файл из Telegram: {e}", reply_markup=_menu_kb())
+        return STATE_MENU
+
+    pending_receipt_blob[chat_id] = (filename, bio, mime)
+    msg.reply_text("Теперь укажи номер карты получателя (можно последние 4 цифры).")
+    return STATE_WAIT_CARD
+
+
+def _find_order_candidates_by_card(session: requests.Session, card_digits: str, allowed_order_ids: Optional[set]) -> List[int]:
+    card_digits = _digits(card_digits)
+    if not card_digits:
+        return []
+    last4 = card_digits[-4:] if len(card_digits) >= 4 else card_digits
+
+    try:
+        rems = _fetch_remainders(session)
+    except Exception:
+        rems = []
+
+    candidates = []
+    for r in rems:
+        oid = r.get("order_id")
+        if oid is None:
+            continue
+        try:
+            oid = int(oid)
+        except Exception:
+            continue
+        if allowed_order_ids and oid not in allowed_order_ids:
+            continue
+        mask = _digits(str(r.get("card_mask") or ""))
+        # Quick match by last4
+        if last4 and (last4 in mask):
+            candidates.append(oid)
+
+    # If nothing matched by mask, try fetching full card for allowed orders (slower but accurate)
+    if not candidates and allowed_order_ids:
+        for oid in list(allowed_order_ids)[:30]:
+            try:
+                od = _fetch_order_detail(session, oid)
+            except Exception:
+                continue
+            full = _digits(str(
+                od.get("card_full")
+                or od.get("card_number")
+                or od.get("card")
+                or od.get("iban")
+                or od.get("card_mask")
+                or ""
+            ))
+            if not full:
+                continue
+            if last4 and (full.endswith(last4) or last4 in full):
+                candidates.append(oid)
+
+    # uniq preserve order
+    out = []
+    for oid in candidates:
+        if oid not in out:
+            out.append(oid)
+    return out
+
+
+def on_card_number(update: Update, context: CallbackContext):
+    s = _ensure_session(update)
+    if not s:
+        return ConversationHandler.END
+
+    chat_id = update.effective_chat.id
+    blob = pending_receipt_blob.get(chat_id)
+    if not blob:
+        update.message.reply_text("Сначала нажми «Прикрепить квитанцию» и пришли файл.", reply_markup=_menu_kb())
+        return STATE_MENU
+
+    card_in = (update.message.text or "").strip()
+    card_digits = _digits(card_in)
+    if len(card_digits) < 4:
+        update.message.reply_text("Нужно хотя бы 4 цифры (последние 4). Попробуй ещё раз.")
+        return STATE_WAIT_CARD
+
+    allowed = pending_paid_orders.get(chat_id) or set()
+    allowed = set(allowed) if allowed else None
+
+    matches = _find_order_candidates_by_card(s, card_digits, allowed)
+
+    if not matches:
         update.message.reply_text(
-            "Нет выбранного остатка. Нажми «Доступные остатки».",
+            "Не нашёл ордер по этой карте среди отмеченных оплат. "
+            "Проверь последние 4 цифры или отметь оплату кнопкой «Оплачено» у остатка.",
             reply_markup=_menu_kb(),
         )
         return STATE_MENU
 
-    file_bytes: Optional[bytes] = None
-    filename: str = "receipt"
+    filename, bio, mime = blob
 
-    try:
-        if update.message.photo:
-            photo = update.message.photo[-1]
-            tg_file = photo.get_file()
-            bio = BytesIO()
-            tg_file.download(out=bio)
-            file_bytes = bio.getvalue()
-            filename = "receipt.jpg"
-        elif update.message.document:
-            doc = update.message.document
-            tg_file = doc.get_file()
-            bio = BytesIO()
-            tg_file.download(out=bio)
-            file_bytes = bio.getvalue()
-            filename = doc.file_name or "receipt.bin"
-        else:
-            update.message.reply_text("Пришли фото или файл (document).", reply_markup=_menu_kb())
-            return STATE_WAIT_RECEIPT
-    except Exception as e:
-        update.message.reply_text(
-            f"Не смог скачать файл из Telegram: {e}", reply_markup=_menu_kb()
-        )
+    if len(matches) == 1:
+        oid = matches[0]
+        try:
+            _upload_receipt_to_order(s, oid, filename, bio, mime)
+        except Exception as e:
+            update.message.reply_text(f"Не удалось прикрепить квитанцию: {e}", reply_markup=_menu_kb())
+            return STATE_MENU
+
+        pending_receipt_blob.pop(chat_id, None)
+        if pending_paid_orders.get(chat_id):
+            pending_paid_orders[chat_id].discard(oid)
+        update.message.reply_text(f"Квитанция прикреплена к ордеру #{oid}.", reply_markup=_menu_kb())
         return STATE_MENU
 
-    try:
-        _upload_receipt_to_order(s, order_id, filename, file_bytes or b"")
-    except Exception as e:
-        update.message.reply_text(f"Не удалось загрузить квитанцию: {e}", reply_markup=_menu_kb())
-        return STATE_MENU
-
-    pending_receipt_order.pop(chat_id, None)
-    update.message.reply_text("Квитанция прикреплена ✅", reply_markup=_menu_kb())
+    # multiple matches → ask to choose
+    rows = []
+    for oid in matches[:20]:
+        rows.append([InlineKeyboardButton(f"Ордер #{oid}", callback_data=f"rem:attach:{oid}")])
+    update.message.reply_text(
+        "Нашёл несколько ордеров по этой карте. Выбери, куда прикрепить квитанцию:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
     return STATE_MENU
+
+
 
 
 def main():
@@ -413,11 +596,16 @@ def main():
             STATE_PASSWORD: [MessageHandler(Filters.text & ~Filters.command, on_password)],
             STATE_MENU: [
                 MessageHandler(Filters.regex(r"^Доступные остатки$"), show_remainders),
-                MessageHandler(Filters.regex(r"^Доступные остатки снова$"), show_remainders),
+                MessageHandler(Filters.regex(r"^Прикрепить квитанцию$"), start_attach_receipt),
+                MessageHandler(Filters.regex(r"^В меню$"), show_menu),
                 CommandHandler("logout", logout),
             ],
-            STATE_WAIT_RECEIPT: [
-                MessageHandler(Filters.photo | Filters.document, on_receipt),
+            STATE_WAIT_RECEIPT_FILE: [
+                MessageHandler(Filters.photo | Filters.document, on_receipt_file),
+                CommandHandler("logout", logout),
+            ],
+            STATE_WAIT_CARD: [
+                MessageHandler(Filters.text & ~Filters.command, on_card_number),
                 CommandHandler("logout", logout),
             ],
         },
@@ -434,3 +622,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
