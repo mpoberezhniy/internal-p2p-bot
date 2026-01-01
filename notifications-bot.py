@@ -13,6 +13,34 @@ STATE_USERNAME, STATE_PASSWORD, STATE_RUNNING = range(3)
 sessions = {}       # chat_id -> requests.Session
 last_notif_id = {}  # chat_id -> int
 
+DATA_DIR = "/data"
+
+def _data_file_for_chat(chat_id: int) -> str:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    return os.path.join(DATA_DIR, str(chat_id))
+
+def _load_last_notif_id(chat_id: int) -> int:
+    path = _data_file_for_chat(chat_id)
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            raw = (f.read() or '').strip()
+        return int(raw) if raw else 0
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        log.warning('failed to read last_notif_id for chat %s: %s', chat_id, e)
+        return 0
+
+def _save_last_notif_id(chat_id: int, last_id: int) -> None:
+    path = _data_file_for_chat(chat_id)
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(str(int(last_id)))
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning('failed to write last_notif_id for chat %s: %s', chat_id, e)
+
 def _csrf(s: requests.Session):
     t = s.cookies.get("csrftoken") or s.cookies.get("csrf")
     if not t:
@@ -73,7 +101,7 @@ def handle_password(update: Update, context: CallbackContext):
         update.message.reply_text("Профиль не получен. /start")
         return ConversationHandler.END
     sessions[chat_id] = s
-    last_notif_id[chat_id] = 0
+    last_notif_id[chat_id] = _load_last_notif_id(chat_id)
     update.message.reply_text("Подписка на уведомления включена. Используйте /stop для отключения.")
     # запустим поллинг через job_queue
     jobname = f"notif_{chat_id}"
@@ -95,6 +123,7 @@ def poll_notifications(context: CallbackContext):
         nid = n.get("id") or 0
         if nid > last_id:
             last_notif_id[chat_id] = nid
+            _save_last_notif_id(chat_id, nid)
         msg = n.get("message", "")
         # основное уведомление
         final_msg = msg

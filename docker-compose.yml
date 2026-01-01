@@ -18,6 +18,8 @@ services:
       - BOT_TOKEN=8585411185:AAGQvXcEu1dWsR2rG2wq3erIfh6lx0X0iUM
       - BASE_URL=${BASE_URL:-http://localhost:8000}
     command: python notifications-bot.py
+    volumes:
+      - notifications_data:/data
     restart: unless-stopped
   profits_bot:
     build: .

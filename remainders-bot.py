@@ -2,6 +2,7 @@ import logging
 import os
 from io import BytesIO
 from typing import Dict, Optional, List, Tuple
+from collections import deque
 
 import requests
 from telegram import (
@@ -41,8 +42,47 @@ BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 
 # In-memory per-chat session state
 user_sessions: Dict[int, requests.Session] = {}
-pending_paid_orders: Dict[int, set] = {}  # chat_id -> set(order_id) marked as paid and waiting for receipt
-pending_receipt_blob: Dict[int, tuple] = {}  # chat_id -> (filename, BytesIO, mime) waiting to be attached
+pending_paid_orders = deque(maxlen=500)  # items: (chat_id:int, order_id:int)
+pending_receipt_blob = deque(maxlen=500)  # items: (chat_id:int, token:str, filename:str, data:bytes, mime:str)
+
+def _pp_remove_paid(chat_id: int, order_id: int) -> None:
+    try:
+        while True:
+            pending_paid_orders.remove((chat_id, order_id))
+    except ValueError:
+        return
+
+def _pp_add_paid(chat_id: int, order_id: int) -> None:
+    _pp_remove_paid(chat_id, order_id)
+    pending_paid_orders.append((chat_id, order_id))
+
+def _pp_paid_set(chat_id: int) -> set:
+    return {oid for (cid, oid) in pending_paid_orders if cid == chat_id}
+
+def _rb_push(chat_id: int, filename: str, bio: BytesIO, mime: str) -> str:
+    token = f"{chat_id}:{int(__import__('time').time()*1000)}:{__import__('uuid').uuid4().hex[:8]}"
+    pending_receipt_blob.append((chat_id, token, filename, bio.getvalue(), mime))
+    return token
+
+def _rb_get(chat_id: int, token: Optional[str]) -> Optional[tuple]:
+    if token:
+        for item in reversed(pending_receipt_blob):
+            if item[0] == chat_id and item[1] == token:
+                return item
+    # fallback: latest receipt for this chat
+    for item in reversed(pending_receipt_blob):
+        if item[0] == chat_id:
+            return item
+    return None
+
+def _rb_pop(chat_id: int, token: Optional[str]) -> None:
+    item = _rb_get(chat_id, token)
+    if not item:
+        return
+    try:
+        pending_receipt_blob.remove(item)
+    except ValueError:
+        pass
 
 
 def _menu_kb() -> ReplyKeyboardMarkup:
@@ -218,8 +258,19 @@ def on_password(update: Update, context: CallbackContext):
 def logout(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     user_sessions.pop(chat_id, None)
-    pending_paid_orders.pop(chat_id, None)
-    pending_receipt_blob.pop(chat_id, None)
+        # drop any pending in-memory state for this chat (bounded deques)
+    try:
+        for item in list(pending_paid_orders):
+            if item[0] == chat_id:
+                pending_paid_orders.remove(item)
+    except Exception:
+        pass
+    try:
+        for item in list(pending_receipt_blob):
+            if item[0] == chat_id:
+                pending_receipt_blob.remove(item)
+    except Exception:
+        pass
     update.message.reply_text(
         "Вышел. /start чтобы войти снова.", reply_markup=ReplyKeyboardRemove()
     )
@@ -338,7 +389,7 @@ def remainders_callback(update: Update, context: CallbackContext):
         amount_uah = reserved_uah or str(od.get("remaining_uah") or "")
 
         # Считаем, что если реквизиты показаны — оплата уже начата и мы ждём квитанцию.
-        pending_paid_orders.setdefault(chat_id, set()).add(order_id)
+        _pp_add_paid(chat_id, order_id)
 
 
         text = (
@@ -361,7 +412,7 @@ def remainders_callback(update: Update, context: CallbackContext):
             query.edit_message_text("Некорректный order_id")
             return STATE_MENU
 
-        pending_paid_orders.setdefault(chat_id, set()).add(order_id)
+        _pp_add_paid(chat_id, order_id)
         query.edit_message_text(
             "Отметил как оплачено. Можешь оплатить другие остатки параллельно.\n\n"
             "Когда будет квитанция — открой меню и нажми «Прикрепить квитанцию».",
@@ -378,12 +429,16 @@ def remainders_callback(update: Update, context: CallbackContext):
 
     if data.startswith("rem:attach:"):
         try:
-            oid = int(data.split(":")[-1])
+            parts = data.split(":")
+            oid = int(parts[2])
+            token = parts[3] if len(parts) > 3 and parts[3] else None
+            context.user_data['receipt_token'] = token or context.user_data.get('receipt_token')
+            
         except Exception:
             query.edit_message_text("Некорректный order_id")
             return STATE_MENU
 
-        blob = pending_receipt_blob.get(chat_id)
+        blob = _rb_get(chat_id, context.user_data.get('receipt_token'))
         if not blob:
             query.edit_message_text("Нет квитанции. Нажми «Прикрепить квитанцию» и пришли файл.")
             return STATE_MENU
@@ -395,9 +450,9 @@ def remainders_callback(update: Update, context: CallbackContext):
             query.edit_message_text(f"Не удалось прикрепить квитанцию: {e}")
             return STATE_MENU
 
-        pending_receipt_blob.pop(chat_id, None)
-        if pending_paid_orders.get(chat_id):
-            pending_paid_orders[chat_id].discard(oid)
+        _rb_pop(chat_id, context.user_data.get('receipt_token'))
+        context.user_data.pop('receipt_token', None)
+        _pp_remove_paid(chat_id, oid)
         query.edit_message_text(f"Квитанция прикреплена к ордеру #{oid}.")
         context.bot.send_message(chat_id=chat_id, text="Выбери действие:", reply_markup=_menu_kb())
         return STATE_MENU
@@ -463,7 +518,8 @@ def on_receipt_file(update: Update, context: CallbackContext):
         msg.reply_text(f"Не смог скачать файл из Telegram: {e}", reply_markup=_menu_kb())
         return STATE_MENU
 
-    pending_receipt_blob[chat_id] = (filename, bio, mime)
+    token = _rb_push(chat_id, filename, bio, mime)
+    context.user_data['receipt_token'] = token
     msg.reply_text("Теперь укажи номер карты получателя (можно последние 4 цифры).")
     return STATE_WAIT_CARD
 
@@ -529,7 +585,7 @@ def on_card_number(update: Update, context: CallbackContext):
         return ConversationHandler.END
 
     chat_id = update.effective_chat.id
-    blob = pending_receipt_blob.get(chat_id)
+    blob = _rb_get(chat_id, context.user_data.get('receipt_token'))
     if not blob:
         update.message.reply_text("Сначала нажми «Прикрепить квитанцию» и пришли файл.", reply_markup=_menu_kb())
         return STATE_MENU
@@ -540,7 +596,7 @@ def on_card_number(update: Update, context: CallbackContext):
         update.message.reply_text("Нужно хотя бы 4 цифры (последние 4). Попробуй ещё раз.")
         return STATE_WAIT_CARD
 
-    allowed = pending_paid_orders.get(chat_id) or set()
+    allowed = _pp_paid_set(chat_id)
     allowed = set(allowed) if allowed else None
 
     matches = _find_order_candidates_by_card(s, card_digits, allowed)
@@ -563,16 +619,16 @@ def on_card_number(update: Update, context: CallbackContext):
             update.message.reply_text(f"Не удалось прикрепить квитанцию: {e}", reply_markup=_menu_kb())
             return STATE_MENU
 
-        pending_receipt_blob.pop(chat_id, None)
-        if pending_paid_orders.get(chat_id):
-            pending_paid_orders[chat_id].discard(oid)
+        _rb_pop(chat_id, context.user_data.get('receipt_token'))
+        context.user_data.pop('receipt_token', None)
+        _pp_remove_paid(chat_id, oid)
         update.message.reply_text(f"Квитанция прикреплена к ордеру #{oid}.", reply_markup=_menu_kb())
         return STATE_MENU
 
     # multiple matches → ask to choose
     rows = []
     for oid in matches[:20]:
-        rows.append([InlineKeyboardButton(f"Ордер #{oid}", callback_data=f"rem:attach:{oid}")])
+        rows.append([InlineKeyboardButton(f"Ордер #{oid}", callback_data=f"rem:attach:{oid}:{context.user_data.get('receipt_token', '')}")])
     update.message.reply_text(
         "Нашёл несколько ордеров по этой карте. Выбери, куда прикрепить квитанцию:",
         reply_markup=InlineKeyboardMarkup(rows),
