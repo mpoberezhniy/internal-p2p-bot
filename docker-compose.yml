@@ -21,14 +21,14 @@ services:
     volumes:
       - notifications_data:/data
     restart: unless-stopped
-  profits_bot:
+  statistics_bot:
     build: .
     network_mode: host
-    container_name: profits_bot
+    container_name: statistics_bot
     environment:
       - BOT_TOKEN=8322988997:AAGsJnREyxa0O3bbtzFGHCbVIoJoxQHSUHo
       - BASE_URL=${BASE_URL:-http://localhost:8000}
-    command: python profits-bot.py
+    command: python statistics-bot.py
     restart: unless-stopped
   remainders_bot:
     build: .
@@ -39,3 +39,7 @@ services:
       - BASE_URL=${BASE_URL:-http://localhost:8000}
     command: python remainders-bot.py
     restart: unless-stopped
+
+volumes:
+  notifications_data:
+    driver: local
