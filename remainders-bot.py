@@ -1,5 +1,7 @@
 import logging
 import os
+import time
+import random
 from io import BytesIO
 from typing import Dict, Optional, List, Tuple
 from collections import deque
@@ -31,6 +33,64 @@ logger = logging.getLogger("remainders-bot")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 
+# API retry knobs (transient network errors / 5xx / 429)
+API_RETRY_TOTAL = int(os.environ.get("API_RETRY_TOTAL", "4"))
+API_RETRY_BACKOFF = float(os.environ.get("API_RETRY_BACKOFF", "0.8"))  # seconds, exponential
+# Comma-separated HTTP statuses that should be retried
+API_RETRY_STATUSES = set(
+    int(x.strip()) for x in os.environ.get("API_RETRY_STATUSES", "429,500,502,503,504").split(",") if x.strip()
+)
+
+
+def _api_request(session: requests.Session, method: str, path: str, **kwargs) -> requests.Response:
+    """Perform an internal-p2p API request with retries.
+
+    Retries only for transient conditions:
+    - network exceptions (timeouts / connection resets)
+    - selected HTTP statuses (by default: 429, 5xx)
+    Does NOT retry 401/403 or other client errors.
+    """
+    url = path if path.startswith("http://") or path.startswith("https://") else f"{BASE_URL}{path}"
+    last_exc = None
+    for attempt in range(1, max(API_RETRY_TOTAL, 1) + 1):
+        try:
+            r = session.request(method, url, **kwargs)
+            # Do not retry auth errors
+            if r.status_code in (401, 403):
+                return r
+            if r.status_code in API_RETRY_STATUSES:
+                if attempt >= API_RETRY_TOTAL:
+                    return r
+                # Honor Retry-After if present (esp. for 429)
+                ra = r.headers.get("Retry-After")
+                try:
+                    ra_s = float(ra) if ra is not None else None
+                except Exception:
+                    ra_s = None
+                sleep_s = API_RETRY_BACKOFF * (2 ** (attempt - 1))
+                if ra_s is not None:
+                    sleep_s = max(sleep_s, ra_s)
+                # cap + small jitter
+                sleep_s = min(sleep_s, 30.0) + random.random() * 0.25
+                time.sleep(sleep_s)
+                continue
+            return r
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ContentDecodingError) as e:
+            last_exc = e
+            if attempt >= API_RETRY_TOTAL:
+                raise
+            sleep_s = min(API_RETRY_BACKOFF * (2 ** (attempt - 1)), 30.0) + random.random() * 0.25
+            time.sleep(sleep_s)
+            continue
+
+    # should be unreachable
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("API request failed with retries")
+
 # Conversation states
 (
     STATE_USERNAME,
@@ -45,6 +105,7 @@ user_sessions: Dict[int, requests.Session] = {}
 pending_paid_orders = deque(maxlen=500)  # items: (chat_id:int, order_id:int)
 pending_receipt_blob = deque(maxlen=500)  # items: (chat_id:int, token:str, filename:str, data:bytes, mime:str)
 
+
 def _pp_remove_paid(chat_id: int, order_id: int) -> None:
     try:
         while True:
@@ -52,37 +113,59 @@ def _pp_remove_paid(chat_id: int, order_id: int) -> None:
     except ValueError:
         return
 
+
 def _pp_add_paid(chat_id: int, order_id: int) -> None:
     _pp_remove_paid(chat_id, order_id)
     pending_paid_orders.append((chat_id, order_id))
 
+
 def _pp_paid_set(chat_id: int) -> set:
     return {oid for (cid, oid) in pending_paid_orders if cid == chat_id}
 
+
 def _rb_push(chat_id: int, filename: str, bio: BytesIO, mime: str) -> str:
-    token = f"{chat_id}:{int(__import__('time').time()*1000)}:{__import__('uuid').uuid4().hex[:8]}"
+    token = f"{chat_id}:{int(__import__('time').time() * 1000)}:{__import__('uuid').uuid4().hex[:8]}"
     pending_receipt_blob.append((chat_id, token, filename, bio.getvalue(), mime))
     return token
 
+
 def _rb_get(chat_id: int, token: Optional[str]) -> Optional[tuple]:
+    """Return receipt blob as (filename, BytesIO, mime, token).
+
+    Internally we store (chat_id, token, filename, raw_bytes, mime).
+    Most call-sites expect a BytesIO.
+    """
+    found = None
     if token:
         for item in reversed(pending_receipt_blob):
             if item[0] == chat_id and item[1] == token:
-                return item
-    # fallback: latest receipt for this chat
-    for item in reversed(pending_receipt_blob):
-        if item[0] == chat_id:
-            return item
-    return None
+                found = item
+                break
+    if not found:
+        # fallback: latest receipt for this chat
+        for item in reversed(pending_receipt_blob):
+            if item[0] == chat_id:
+                found = item
+                break
+    if not found:
+        return None
+    _chat_id, tok, filename, raw, mime = found
+    bio = BytesIO(raw)
+    bio.seek(0)
+    return (filename, bio, mime, tok)
+
 
 def _rb_pop(chat_id: int, token: Optional[str]) -> None:
-    item = _rb_get(chat_id, token)
-    if not item:
+    if not token:
         return
-    try:
-        pending_receipt_blob.remove(item)
-    except ValueError:
-        pass
+    # Remove the *stored* tuple (chat_id, token, filename, raw_bytes, mime)
+    for item in list(pending_receipt_blob):
+        if item[0] == chat_id and item[1] == token:
+            try:
+                pending_receipt_blob.remove(item)
+            except ValueError:
+                pass
+            return
 
 
 def _menu_kb() -> ReplyKeyboardMarkup:
@@ -101,7 +184,7 @@ def _get_csrf_token(session: requests.Session) -> Optional[str]:
     # poke API / root to get CSRF cookie if server issues it
     for url in (f"{BASE_URL}/api/me/", f"{BASE_URL}/"):
         try:
-            session.get(url, timeout=10)
+            _api_request(session, "GET", url, timeout=10)
             token = session.cookies.get("csrftoken") or session.cookies.get("csrf")
             if token:
                 return token
@@ -125,7 +208,7 @@ def _csrf_headers(session: requests.Session) -> dict:
 def api_login(username: str, password: str) -> Optional[requests.Session]:
     s = requests.Session()
     try:
-        r = s.post(
+        r = _api_request(s, "POST", 
             f"{BASE_URL}/api/login/",
             data={"username": username, "password": password},
             timeout=15,
@@ -151,7 +234,9 @@ def _ensure_session(update: Update) -> Optional[requests.Session]:
 
 
 def _fetch_remainders(session: requests.Session) -> List[dict]:
-    r = session.get(f"{BASE_URL}/api/taker-remainders/", timeout=20)
+    r = _api_request(session, "GET", 
+        f"{BASE_URL}/api/taker-remainders/", timeout=20
+    )
     if not r.ok:
         raise RuntimeError(
             f"GET /api/taker-remainders/ failed: {r.status_code} {r.text}"
@@ -165,7 +250,7 @@ def _fetch_remainders(session: requests.Session) -> List[dict]:
 
 def _reserve_remainder(session: requests.Session, order_id: int) -> Tuple[str, str]:
     # Returns (reserved_uah, detail)
-    r = session.post(
+    r = _api_request(session, "POST",
         f"{BASE_URL}/api/taker-remainders/reserve/",
         json={"order_id": order_id},
         headers=_csrf_headers(session),
@@ -180,7 +265,7 @@ def _reserve_remainder(session: requests.Session, order_id: int) -> Tuple[str, s
 
 
 def _fetch_order_detail(session: requests.Session, order_id: int) -> dict:
-    r = session.get(f"{BASE_URL}/api/orders/{order_id}/", timeout=20)
+    r = _api_request(session, "GET", f"{BASE_URL}/api/orders/{order_id}/", timeout=20)
     if not r.ok:
         raise RuntimeError(
             f"GET /api/orders/{order_id}/ failed: {r.status_code} {r.text}"
@@ -197,7 +282,7 @@ def api_add_order_comment(session: requests.Session, order_id: int, text: str, f
         kwargs["data"] = data
         if files:
             kwargs["files"] = files
-        r = session.post(f"{BASE_URL}/api/order/{order_id}/comments/", **kwargs)
+        r = _api_request(session, "POST", f"{BASE_URL}/api/order/{order_id}/comments/", **kwargs)
         if r.ok:
             return True, "OK"
         try:
@@ -216,7 +301,6 @@ def _upload_receipt_to_order(session: requests.Session, order_id: int, filename:
     ok, msg = api_add_order_comment(session, order_id, "Квитанция по оплате остатка", files=files)
     if not ok:
         raise RuntimeError(f"Upload receipt failed: {msg}")
-
 
 
 # ───────────────────────── Handlers ────────────────────────────
@@ -258,7 +342,7 @@ def on_password(update: Update, context: CallbackContext):
 def logout(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     user_sessions.pop(chat_id, None)
-        # drop any pending in-memory state for this chat (bounded deques)
+    # drop any pending in-memory state for this chat (bounded deques)
     try:
         for item in list(pending_paid_orders):
             if item[0] == chat_id:
@@ -391,7 +475,6 @@ def remainders_callback(update: Update, context: CallbackContext):
         # Считаем, что если реквизиты показаны — оплата уже начата и мы ждём квитанцию.
         _pp_add_paid(chat_id, order_id)
 
-
         text = (
             f"Ордер: {ext}\n"
             f"Сумма остатка: {amount_uah} грн\n"
@@ -433,7 +516,7 @@ def remainders_callback(update: Update, context: CallbackContext):
             oid = int(parts[2])
             token = parts[3] if len(parts) > 3 and parts[3] else None
             context.user_data['receipt_token'] = token or context.user_data.get('receipt_token')
-            
+
         except Exception:
             query.edit_message_text("Некорректный order_id")
             return STATE_MENU
@@ -443,14 +526,14 @@ def remainders_callback(update: Update, context: CallbackContext):
             query.edit_message_text("Нет квитанции. Нажми «Прикрепить квитанцию» и пришли файл.")
             return STATE_MENU
 
-        filename, bio, mime = blob
+        filename, bio, mime, tok = blob
         try:
             _upload_receipt_to_order(s, oid, filename, bio, mime)
         except Exception as e:
             query.edit_message_text(f"Не удалось прикрепить квитанцию: {e}")
             return STATE_MENU
 
-        _rb_pop(chat_id, context.user_data.get('receipt_token'))
+        _rb_pop(chat_id, tok)
         context.user_data.pop('receipt_token', None)
         _pp_remove_paid(chat_id, oid)
         query.edit_message_text(f"Квитанция прикреплена к ордеру #{oid}.")
@@ -524,7 +607,8 @@ def on_receipt_file(update: Update, context: CallbackContext):
     return STATE_WAIT_CARD
 
 
-def _find_order_candidates_by_card(session: requests.Session, card_digits: str, allowed_order_ids: Optional[set]) -> List[int]:
+def _find_order_candidates_by_card(session: requests.Session, card_digits: str, allowed_order_ids: Optional[set]) -> \
+List[int]:
     card_digits = _digits(card_digits)
     if not card_digits:
         return []
@@ -609,7 +693,7 @@ def on_card_number(update: Update, context: CallbackContext):
         )
         return STATE_MENU
 
-    filename, bio, mime = blob
+    filename, bio, mime, tok = blob
 
     if len(matches) == 1:
         oid = matches[0]
@@ -619,7 +703,7 @@ def on_card_number(update: Update, context: CallbackContext):
             update.message.reply_text(f"Не удалось прикрепить квитанцию: {e}", reply_markup=_menu_kb())
             return STATE_MENU
 
-        _rb_pop(chat_id, context.user_data.get('receipt_token'))
+        _rb_pop(chat_id, tok)
         context.user_data.pop('receipt_token', None)
         _pp_remove_paid(chat_id, oid)
         update.message.reply_text(f"Квитанция прикреплена к ордеру #{oid}.", reply_markup=_menu_kb())
@@ -628,14 +712,13 @@ def on_card_number(update: Update, context: CallbackContext):
     # multiple matches → ask to choose
     rows = []
     for oid in matches[:20]:
-        rows.append([InlineKeyboardButton(f"Ордер #{oid}", callback_data=f"rem:attach:{oid}:{context.user_data.get('receipt_token', '')}")])
+        rows.append([InlineKeyboardButton(f"Ордер #{oid}",
+                                          callback_data=f"rem:attach:{oid}:{context.user_data.get('receipt_token', '')}")])
     update.message.reply_text(
         "Нашёл несколько ордеров по этой карте. Выбери, куда прикрепить квитанцию:",
         reply_markup=InlineKeyboardMarkup(rows),
     )
     return STATE_MENU
-
-
 
 
 def main():

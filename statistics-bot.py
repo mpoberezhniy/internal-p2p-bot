@@ -43,6 +43,7 @@ import logging
 import os
 import io
 import csv
+import textwrap
 from collections import defaultdict, OrderedDict, Counter
 from datetime import datetime, date, timedelta
 from decimal import Decimal, getcontext
@@ -83,6 +84,8 @@ from telegram.ext import (
     Filters,
     CallbackContext,
 )
+
+import legacy_profits_bot as legacy_profit
 
 
 # --- decimal precision ---
@@ -131,6 +134,38 @@ def floor_datetime(dt: datetime, interval: str) -> datetime:
 
 def parse_date_str(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%d")
+
+
+def legacy_profit_report_text(from_dt: datetime, to_dt: datetime, cookies: Dict[str, str]) -> str:
+    """
+    Compute the legacy /profit output using the original profits-bot logic
+    (imported without modifications as ``legacy_profits_bot``).
+    This function only orchestrates calls to the legacy code and returns the
+    same formatted text.
+    """
+    # Reuse legacy validation and configuration
+    legacy_profit.ensure_binance_config()
+
+    extra_filters: Dict[str, str] = {}
+    csv_text = legacy_profit.fetch_internal_p2p_csv(from_dt, to_dt, extra_filters, cookies)
+    bought_fiat, bought_crypto, rows_count = legacy_profit.aggregate_internal_p2p_from_csv(csv_text)
+
+    sell_client = Client(legacy_profit.BINANCE_API_KEY_SELL, legacy_profit.BINANCE_API_SECRET_SELL)
+    sell_trades = legacy_profit.get_binance_sell_trades(sell_client, from_dt, to_dt)
+    sold_fiat, sold_crypto = legacy_profit.aggregate_trades_binance(sell_trades)
+    cancelled_orders, cancelled_usdt = legacy_profit.aggregate_cancelled_trades_binance(sell_trades)
+
+    return legacy_profit.format_profit_message(
+        from_dt,
+        to_dt,
+        bought_fiat,
+        bought_crypto,
+        rows_count,
+        sold_fiat,
+        sold_crypto,
+        cancelled_orders,
+        cancelled_usdt,
+    )
 
 
 # ============ FETCH FUNCTIONS ============
@@ -362,6 +397,7 @@ def create_statistics_report_pdf(
     to_dt: datetime,
     interval: str,
     withdrawals: Optional[List[dict]] = None,
+    cookies: Optional[Dict[str, str]] = None,
 ) -> bytes:
     """
     Generate a PDF report containing charts and tables based on
@@ -425,12 +461,25 @@ def create_statistics_report_pdf(
     total_withdraw_off_usdt = 0.0
     total_cancelled = 0
     total_profit_usdt = 0.0
+    # New: track the actual total profit across the entire period.  This
+    # represents the sum of profit amounts (in USDT) computed from
+    # aggregated buy/sell volumes.  Unlike ``total_profit_usdt`` above,
+    # which is the sum of per‑interval average profits, this value
+    # accumulates the profit derived by comparing the average buy and
+    # sell rates for each bucket.  It is similar to how the original
+    # profits bot calculated total profit.
     total_profit_amount = 0.0
+    # List to store profit amounts for each interval.  These values
+    # represent the actual profit (in USDT) computed from aggregated
+    # buy/sell volumes per bucket.  They will be used for the
+    # "Profit per interval" chart.
     profit_amounts: List[float] = []
     total_profit_rate_sum = 0.0
     total_profit_rate_count = 0
     total_bought_usdt = 0.0
     total_sold_usdt = 0.0
+    total_bought_uah = 0.0
+    total_sold_uah = 0.0
     total_net_tx_flow = 0.0
     # Convert records to lists
     for rec in sorted(data, key=lambda r: r.get("period_start", "")):
@@ -450,6 +499,16 @@ def create_statistics_report_pdf(
         sold_usdt.append(su)
         total_bought_usdt += bu
         total_sold_usdt += su
+        try:
+            bu_uah = float(rec.get("bought_uah") or 0.0)
+        except Exception:
+            bu_uah = 0.0
+        try:
+            su_uah = float(rec.get("sold_uah") or 0.0)
+        except Exception:
+            su_uah = 0.0
+        total_bought_uah += bu_uah
+        total_sold_uah += su_uah
         # profit averages (may be None)
         p_usdt = rec.get("profit_usdt_avg")
         p_rate = rec.get("profit_rate_avg")
@@ -533,6 +592,19 @@ def create_statistics_report_pdf(
             profit_amounts.append(0.0)
     # Summary profit rate average
     avg_profit_rate = (total_profit_rate_sum / total_profit_rate_count) if total_profit_rate_count else None
+    # Overall profit using totals (legacy profits-bot style; computed over full range)
+    legacy_profit_rate = None
+    legacy_profit_usdt = None
+    if total_bought_usdt and total_sold_usdt and total_bought_uah and total_sold_uah:
+        try:
+            avg_buy_rate_total = Decimal(str(total_bought_uah)) / Decimal(str(total_bought_usdt))
+            avg_sell_rate_total = Decimal(str(total_sold_uah)) / Decimal(str(total_sold_usdt))
+            legacy_profit_rate = avg_sell_rate_total / avg_buy_rate_total
+            sold_crypto_total = Decimal(str(total_sold_usdt))
+            legacy_profit_usdt = sold_crypto_total * avg_sell_rate_total / avg_buy_rate_total - sold_crypto_total - sold_crypto_total / Decimal("1000")
+        except Exception:
+            legacy_profit_rate = None
+            legacy_profit_usdt = None
     # Build images
     images: List[Tuple[str, bytes]] = []
     # Helper functions
@@ -649,8 +721,8 @@ def create_statistics_report_pdf(
         f"Profit per {interval}", [float(v) for v in profit_amounts], f"Profit ({ASSET})"
     )))
     # Profit rate average
-    images.append((f"Average profit rate per {interval}", plot_line(
-        f"Average profit rate per {interval}", [float(v) for v in profit_rate], "Rate"
+    images.append((f"Profit rate per {interval}", plot_line(
+        f"Profit rate per {interval}", [float(v) for v in profit_rate], "Rate"
     )))
     # Cancelled trades
     images.append((f"Cancelled trades per {interval}", plot_line(
@@ -794,8 +866,9 @@ def create_statistics_report_pdf(
         f"Total withdraw off‑chain count: {total_withdraw_off_count}",
         f"Total withdraw on‑chain USDT: {total_withdraw_on_usdt:.4f}",
         f"Total withdraw off‑chain USDT: {total_withdraw_off_usdt:.4f}",
-        f"Total profit: {total_profit_amount:.4f}",
-        f"Average profit rate: {avg_profit_rate:.4f}" if avg_profit_rate is not None else "Average profit rate: N/A",
+        f"Total profit (sum per-interval): {total_profit_amount:.4f} {ASSET}",
+        f"Total profit: {legacy_profit_usdt:.4f} {ASSET}" if legacy_profit_usdt is not None else "Total profit (legacy): N/A",
+        f"Profit rate: {legacy_profit_rate:.4f}" if legacy_profit_rate is not None else "Profit rate (legacy): N/A",
     ]
     for line in summary_lines:
         c.drawString(50, y_pos, line)
@@ -804,6 +877,36 @@ def create_statistics_report_pdf(
             c.showPage()
             y_pos = height - 40
             c.setFont("Helvetica", 9)
+
+    # --- Page 2: Legacy bot data (profits-bot /profit output) ---
+    c.showPage()
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, height - 40, "Legacy bot data")
+    c.setFont("Helvetica", 10)
+
+    legacy_text: str
+    if cookies:
+        try:
+            legacy_text = legacy_profit_report_text(from_dt, to_dt, cookies)
+        except Exception as e:
+            legacy_text = f"Ошибка при расчёте legacy profit: {e}"
+    else:
+        legacy_text = "Нет авторизации для internal-p2p (cookies не переданы)."
+
+    y_legacy = height - 70
+    max_width_chars = 110
+    for raw_line in legacy_text.splitlines() or [""]:
+        for line in (textwrap.wrap(raw_line, width=max_width_chars) or [""]):
+            c.drawString(50, y_legacy, line)
+            y_legacy -= 12
+            if y_legacy < 60:
+                c.showPage()
+                c.setFont("Helvetica", 10)
+                y_legacy = height - 40
+
+    # Continue with charts after the legacy page
+    c.showPage()
+
     # The list of current balances has been removed from the report.  To keep
     # the first page focused on aggregated statistics, the balances summary
     # is omitted entirely.  If a balances overview is needed, it can be
@@ -1391,6 +1494,7 @@ def stats(update: Update, context: CallbackContext) -> None:
                 to_dt,
                 interval,
                 withdrawals=withdrawals,
+                cookies=cookies,
             )
             update.message.reply_document(
                 document=io.BytesIO(pdf_bytes),
@@ -1524,7 +1628,7 @@ def stats(update: Update, context: CallbackContext) -> None:
     # Display actual total profit and legacy sum of average profits.  The
     # actual profit is computed using aggregated buy/sell volumes.
     lines.append(f"Итоговая прибыль: {total_profit_amount_sum:.4f} {ASSET}")
-    lines.append(f"Сумма средней прибыли по интервалам: {total_profit_usdt_sum:.4f} {ASSET}")
+    lines.append(f"Сумма прибыли по интервалам: {total_profit_usdt_sum:.4f} {ASSET}")
     avg_pr = (total_profit_rate_sum / profit_rate_count) if profit_rate_count else None
     lines.append(f"Средняя прибыльная ставка: {avg_pr:.4f}" if avg_pr is not None else "Средняя прибыльная ставка: N/A")
     # (Removed Top balances section from the textual summary.)
@@ -1540,6 +1644,7 @@ def main() -> None:
     dp.add_handler(CommandHandler("help", help_cmd))
     dp.add_handler(CommandHandler("login", login))
     dp.add_handler(CommandHandler("stats", stats))
+    dp.add_handler(CommandHandler("profit", legacy_profit.profit))
     logger.info("Statistics bot starting...")
     updater.start_polling()
     updater.idle()
